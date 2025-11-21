@@ -38,7 +38,7 @@ extract_terms <- function(path) {
   df <- fread(path, select = c("Medicines reported as being taken","MedDRA reaction terms"))
   ing <- unique(str_trim(unlist(str_split(gsub("[()]", "", unlist(str_extract_all(df[[1]], "\\((.*?)\\)"))), "[;,/]"))))
   react <- unique(str_trim(unlist(str_split(df[[2]], "•"))))
-  list(ing = ing[ing != ""], react = react[react != ""])
+  list(ing = ing[ing != ""], react = react[react != ""]))
 }
 
 dict <- lapply(files, extract_terms)
@@ -51,17 +51,33 @@ all_reactions   <- sort(unique(unlist(lapply(dict, `[[`, "react"))))
 for (i in seq_along(files)) {
   df <- fread(files[i])
   
-  df[, Age := fifelse(is.na(as.numeric(`Age (years)`)) | as.numeric(`Age (years)`) < 0,
-                      mean(as.numeric(`Age (years)`), na.rm = TRUE),
-                      as.numeric(`Age (years)`))]
-  
-  df[, Gender := fcase(tolower(Gender)=="female",0,
-                       tolower(Gender)=="male",1,
-                       default = mean(fifelse(tolower(Gender)=="female",0,
-                                              fifelse(tolower(Gender)=="male",1,NA_real_)),
-                                      na.rm=TRUE))]
-  
+  # ---------------- AGE CLEAN ----------------
+  df[, Age := as.numeric(`Age (years)`)]
+  df[Age < 0 | is.na(Age), Age := mean(Age, na.rm = TRUE)]
+
+  # ---------------- AGE GROUPS ----------------
+  df[, AgeGroup := fcase(
+        Age <= 17, "G1",
+        Age <= 35, "G2",
+        Age <= 50, "G3",
+        Age <= 65, "G4",
+        Age > 65, "G5"
+      )]
+
+  # Row ID for merge later
   df[, RowID := .I]
+
+  # ---------------- GENDER ENCODING ----------------
+  df[, Gender := fcase(
+                     tolower(Gender)=="female", 0,
+                     tolower(Gender)=="male", 1,
+                     default = mean(
+                       fifelse(tolower(Gender)=="female",0,
+                               fifelse(tolower(Gender)=="male",1,NA_real_)),
+                       na.rm=TRUE)
+                   )]
+  
+  # ---------------- INGREDIENT MATRIX ----------------
   df[, temp_ing := str_extract_all(`Medicines reported as being taken`, "\\((.*?)\\)")]
   df[, susp_val := ifelse(grepl("Suspected", `Medicines reported as being taken`, TRUE), 2, 1)]
   
@@ -75,7 +91,8 @@ for (i in seq_along(files)) {
   else data.table(RowID = df$RowID)
   
   setnames(matrix_ing, names(matrix_ing)[-1], paste0("x ", names(matrix_ing)[-1]))
-  
+
+  # ---------------- REACTION MATRIX ----------------
   dt_react <- df[, .(react = str_trim(unlist(str_split(`MedDRA reaction terms`, "•")))), RowID]
   dt_react <- dt_react[react != ""]
   
@@ -84,17 +101,47 @@ for (i in seq_along(files)) {
   else data.table(RowID = df$RowID)
   
   setnames(matrix_react, names(matrix_react)[-1], paste0("y ", names(matrix_react)[-1]))
-  matrix_react[, names(matrix_react)[-1] := lapply(.SD, \(x) as.integer(x > 0)), .SDcols = -1]
+  react_cols <- names(matrix_react)[-1]
+  matrix_react[, (react_cols) := lapply(.SD, \(x) as.integer(x > 0)), .SDcols = react_cols]
+
+  # ---------------------------------------------------------
+  # AGE-RISK ENCODING (weight = adverse event rate)
+  # ---------------------------------------------------------
   
-  final <- merge(df[, .(RowID, `x Age`=Age, `x Gender`=Gender)], matrix_ing, "RowID", TRUE)
+  # Any AE?
+  df[, AnyReact := as.integer(rowSums(matrix_react[.SD, .SDcols = react_cols]) > 0)]
+  
+  # Compute AE frequency for each age group
+  age_weight_table <- df[, .(Risk = mean(AnyReact, na.rm = TRUE)), by = AgeGroup]
+
+  # Add weight back to df
+  df <- merge(df, age_weight_table, by = "AgeGroup", all.x = TRUE)
+  
+  # Final numeric encoded feature
+  df[, `x AgeRisk` := Risk]
+
+  # Drop helper columns
+  df[, c("Risk", "AnyReact") := NULL]
+
+  # ---------------- MERGE EVERYTHING ----------------
+  final <- data.table(RowID = df$RowID,
+                      `x Age` = df$Age,
+                      `x Gender` = df$Gender,
+                      `x AgeRisk` = df$`x AgeRisk`)
+
+  final <- merge(final, matrix_ing, "RowID", TRUE)
   final <- merge(final, matrix_react, "RowID", TRUE)
+
   final[is.na(final)] <- 0
   final[, RowID := NULL]
   
+  # ---------------- ALIGN COLUMNS (GLOBAL DICTIONARY) ----------------
   miss_ing   <- setdiff(paste0("x ", all_ingredients), names(final))
   miss_react <- setdiff(paste0("y ", all_reactions), names(final))
+  
   if (length(miss_ing))   final[, (miss_ing) := 0]
   if (length(miss_react)) final[, (miss_react) := 0]
   
+  # ---------------- WRITE ----------------
   fwrite(final, file.path(output_dir, paste0("processed_", i, ".csv")))
 }
