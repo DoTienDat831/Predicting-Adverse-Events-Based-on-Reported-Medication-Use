@@ -145,8 +145,6 @@ for (i in seq_along(files)) {
   }
   
   # --- 5. MERGE (UPDATED: KEEP RAW AGE) ---
-  # We keep 'x Age' (raw number) for XGBoost/RF
-  # We keep 'x AgeGroup' (bins) for analysis/Linear trends
   base_df <- df[, .(RowID, `x Age` = age_num, `x AgeGroup`, `x Gender` = Gender)]
   
   final <- merge(base_df, matrix_ing, by = "RowID", all = TRUE)
